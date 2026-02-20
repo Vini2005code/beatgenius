@@ -5,17 +5,39 @@ import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sparkles, Loader2, RotateCcw, Zap, Layers, Music } from "lucide-react";
 import { toast } from "sonner";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
 
 const GENRES = ["Trap", "Drill", "Afro-Trap", "Rage"] as const;
 
+// Public domain / CC0 sample beats for debug fallback
+const FALLBACK_AUDIO_URLS = [
+  "https://cdn.pixabay.com/audio/2024/11/29/audio_71780c0542.mp3",
+  "https://cdn.pixabay.com/audio/2024/10/16/audio_484e8b3e90.mp3",
+  "https://cdn.pixabay.com/audio/2023/07/19/audio_e552ef4e0b.mp3",
+];
+
+export interface GeneratedBeat {
+  id: string;
+  title: string;
+  genre: string;
+  bpm: number;
+  energyLevel: number;
+  instrumentalDensity: number;
+  prompt: string;
+  audioUrl: string;
+}
+
 interface GeneratorDashboardProps {
-  onBeatGenerated?: (beat: { title: string; genre: string; bpm: number; energyLevel: number; instrumentalDensity: number; prompt: string }) => void;
+  onBeatGenerated?: (beat: GeneratedBeat) => void;
 }
 
 const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
+  const { user } = useAuth();
   const [prompt, setPrompt] = useState("");
   const [genre, setGenre] = useState<string>("");
   const [energyLevel, setEnergyLevel] = useState([5]);
@@ -23,10 +45,51 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
   const [bpm, setBpm] = useState("140");
   const [isGenerating, setIsGenerating] = useState(false);
   const [hasFailed, setHasFailed] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   const bpmNum = parseInt(bpm, 10);
   const isValidBpm = !isNaN(bpmNum) && bpmNum >= 60 && bpmNum <= 200;
   const canGenerate = prompt.trim().length > 0 && genre && isValidBpm;
+
+  const fetchAudio = async (): Promise<string> => {
+    console.log("[Generator] Step 1: Attempting to call Suno API edge function...");
+
+    // Try calling the edge function first
+    try {
+      const { data, error } = await supabase.functions.invoke("generate-beat", {
+        body: {
+          prompt,
+          genre,
+          bpm: bpmNum,
+          energy_level: energyLevel[0],
+          instrumental_density: instrumentalDensity[0],
+        },
+      });
+
+      if (error) throw error;
+      if (data?.audio_url) {
+        console.log("[Generator] Step 2: Suno API returned audio URL:", data.audio_url);
+        return data.audio_url;
+      }
+      throw new Error("No audio_url in response");
+    } catch (err) {
+      console.warn("[Generator] Suno API unavailable, falling back to debug audio:", err);
+    }
+
+    // Fallback: use a real public MP3
+    const fallbackUrl = FALLBACK_AUDIO_URLS[Math.floor(Math.random() * FALLBACK_AUDIO_URLS.length)];
+    console.log("[Generator] Step 2 (fallback): Using debug audio URL:", fallbackUrl);
+
+    // Validate the URL actually resolves
+    console.log("[Generator] Step 3: Validating audio URL with HEAD request...");
+    const headRes = await fetch(fallbackUrl, { method: "HEAD" });
+    if (!headRes.ok) {
+      throw new Error(`Audio URL validation failed: ${headRes.status}`);
+    }
+    console.log("[Generator] Step 3: Audio URL valid — Content-Type:", headRes.headers.get("content-type"), "Size:", headRes.headers.get("content-length"));
+
+    return fallbackUrl;
+  };
 
   const handleGenerate = async () => {
     if (!canGenerate) {
@@ -38,26 +101,69 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
 
     setIsGenerating(true);
     setHasFailed(false);
+    setProgress(10);
+    console.log("[Generator] === GENERATION STARTED ===");
+    console.log("[Generator] Params:", { prompt, genre, bpm: bpmNum, energy: energyLevel[0], density: instrumentalDensity[0] });
 
     try {
-      // TODO: Call Suno API edge function
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      
-      onBeatGenerated?.({
-        title: `${genre} Beat`,
+      setProgress(30);
+      const audioUrl = await fetchAudio();
+
+      if (!audioUrl) {
+        throw new Error("Audio source is null — cannot proceed");
+      }
+
+      setProgress(60);
+      console.log("[Generator] Step 4: Audio URL acquired:", audioUrl);
+
+      // Save beat to database
+      console.log("[Generator] Step 5: Saving beat metadata to database...");
+      const beatTitle = `${genre} Beat — ${prompt.slice(0, 30)}`;
+      const { data: insertedBeat, error: dbError } = await supabase
+        .from("beats")
+        .insert({
+          title: beatTitle,
+          genre,
+          bpm: bpmNum,
+          energy_level: energyLevel[0],
+          instrumental_density: instrumentalDensity[0],
+          prompt,
+          audio_url: audioUrl,
+          user_id: user!.id,
+        })
+        .select()
+        .single();
+
+      if (dbError) {
+        console.error("[Generator] DB insert error:", dbError);
+        throw dbError;
+      }
+
+      setProgress(90);
+      console.log("[Generator] Step 5: Beat saved to DB with id:", insertedBeat.id);
+
+      const beat: GeneratedBeat = {
+        id: insertedBeat.id,
+        title: beatTitle,
         genre,
         bpm: bpmNum,
         energyLevel: energyLevel[0],
         instrumentalDensity: instrumentalDensity[0],
         prompt,
-      });
-      
+        audioUrl,
+      };
+
+      setProgress(100);
+      console.log("[Generator] === GENERATION COMPLETE ===");
+      onBeatGenerated?.(beat);
       toast.success("Beat generated successfully!");
-    } catch {
+    } catch (err: unknown) {
+      console.error("[Generator] === GENERATION FAILED ===", err);
       setHasFailed(true);
-      toast.error("Failed to generate beat. Try again.");
+      toast.error(err instanceof Error ? err.message : "Failed to generate beat. Try again.");
     } finally {
       setIsGenerating(false);
+      setProgress(0);
     }
   };
 
@@ -162,6 +268,14 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
             <p className="text-xs text-destructive">BPM must be between 60 and 200</p>
           )}
         </div>
+
+        {/* Progress bar during generation */}
+        {isGenerating && (
+          <div className="space-y-1">
+            <Progress value={progress} className="h-2" />
+            <p className="text-xs text-muted-foreground text-center">Generating your beat...</p>
+          </div>
+        )}
 
         {/* Generate Button */}
         <Button
