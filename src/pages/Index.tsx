@@ -1,12 +1,22 @@
+import { useState } from "react";
 import { Navigate } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
-import GeneratorDashboard from "@/components/GeneratorDashboard";
+import GeneratorDashboard, { type GeneratedBeat } from "@/components/GeneratorDashboard";
 import BeatLibrary from "@/components/BeatLibrary";
+import AudioPlayer from "@/components/AudioPlayer";
 import { Button } from "@/components/ui/button";
 import { LogOut, Music, Loader2 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 
 const Index = () => {
   const { user, loading, signOut } = useAuth();
+  const queryClient = useQueryClient();
+  const [activeBeat, setActiveBeat] = useState<{
+    audioUrl: string;
+    title: string;
+    genre: string;
+    bpm: number;
+  } | null>(null);
 
   if (loading) {
     return (
@@ -17,6 +27,28 @@ const Index = () => {
   }
 
   if (!user) return <Navigate to="/auth" replace />;
+
+  const handleBeatGenerated = (beat: GeneratedBeat) => {
+    console.log("[Index] Beat generated, loading into player:", beat.title);
+    setActiveBeat({
+      audioUrl: beat.audioUrl,
+      title: beat.title,
+      genre: beat.genre,
+      bpm: beat.bpm,
+    });
+    queryClient.invalidateQueries({ queryKey: ["beats"] });
+  };
+
+  const handleSelectBeat = (beat: { audio_url: string | null; title: string; genre: string; bpm: number }) => {
+    if (!beat.audio_url) return;
+    console.log("[Index] Library beat selected:", beat.title);
+    setActiveBeat({
+      audioUrl: beat.audio_url,
+      title: beat.title,
+      genre: beat.genre,
+      bpm: beat.bpm,
+    });
+  };
 
   return (
     <div className="dark min-h-screen bg-background">
@@ -37,10 +69,18 @@ const Index = () => {
       </header>
 
       {/* Main Content */}
-      <main className="container py-6">
+      <main className="container py-6 space-y-6">
+        {/* Audio Player — persistent at top */}
+        <AudioPlayer
+          audioUrl={activeBeat?.audioUrl ?? null}
+          title={activeBeat?.title}
+          genre={activeBeat?.genre}
+          bpm={activeBeat?.bpm}
+        />
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <GeneratorDashboard />
-          <BeatLibrary />
+          <GeneratorDashboard onBeatGenerated={handleBeatGenerated} />
+          <BeatLibrary onSelectBeat={handleSelectBeat} />
         </div>
       </main>
     </div>
