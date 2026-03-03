@@ -17,11 +17,20 @@ Deno.serve(async (req) => {
       throw new Error("HUGGING_FACE_ACCESS_TOKEN is not configured");
     }
 
-    const { prompt, genre, bpm, energy_level, instrumental_density } = await req.json();
-    console.log("[generate-beat] Received request:", { prompt, genre, bpm });
+    const body = await req.json();
+    const { prompt, genre, bpm, energy_level, instrumental_density, mode, reference_audio_base64 } = body;
+    console.log("[generate-beat] Received request:", { genre, bpm, mode: mode || "prompt" });
 
-    // Build a rich prompt for MusicGen
-    const musicPrompt = `${genre} beat, ${bpm} BPM, ${prompt}`.slice(0, 500);
+    // Build prompt for MusicGen
+    let musicPrompt: string;
+    if (mode === "reference" && reference_audio_base64) {
+      // For reference mode, we describe the style we want since MusicGen is text-to-audio
+      musicPrompt = `${genre} instrumental beat, ${bpm} BPM, ${prompt}. Unique copyright-free instrumental with professional production quality.`;
+      console.log("[generate-beat] Reference mode — generating unique version with style prompt");
+    } else {
+      musicPrompt = `${genre} beat, ${bpm} BPM, ${prompt}`;
+    }
+    musicPrompt = musicPrompt.slice(0, 500);
     console.log("[generate-beat] Sending to Hugging Face MusicGen:", musicPrompt);
 
     // Call Hugging Face Inference API
@@ -45,6 +54,11 @@ Deno.serve(async (req) => {
     if (!hfResponse.ok) {
       const errorText = await hfResponse.text();
       console.error("[generate-beat] Hugging Face API error:", hfResponse.status, errorText);
+
+      // Check for model loading state
+      if (hfResponse.status === 503) {
+        throw new Error("AI model is loading — please retry in 30 seconds");
+      }
       throw new Error(`Hugging Face API error: ${hfResponse.status} — ${errorText}`);
     }
 
