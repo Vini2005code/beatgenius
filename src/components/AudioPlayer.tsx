@@ -51,7 +51,7 @@ const AudioPlayer = ({ audioUrl, title, genre, bpm }: AudioPlayerProps) => {
       barRadius: 2,
       height: 80,
       normalize: true,
-      backend: "WebAudio",
+      backend: "MediaElement",
     });
 
     wavesurferRef.current = ws;
