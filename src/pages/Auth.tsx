@@ -72,7 +72,7 @@ const Auth = () => {
             toast.error(error.message);
           }
         } else {
-          setSignupSuccess(true);
+          toast.success("Conta criada com sucesso! Entrando...");
         }
       }
     } finally {
