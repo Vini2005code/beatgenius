@@ -46,7 +46,7 @@ Deno.serve(async (req) => {
     let hfResponse: Response;
     try {
       hfResponse = await fetch(
-        "https://router.huggingface.co/hf-inference/models/facebook/musicgen-small",
+        "https://api-inference.huggingface.co/models/facebook/musicgen-small",
         {
           method: "POST",
           headers: {
