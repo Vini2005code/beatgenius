@@ -52,6 +52,7 @@ Deno.serve(async (req) => {
           headers: {
             Authorization: `Bearer ${hfToken}`,
             "Content-Type": "application/json",
+            "x-wait-for-model": "true",
           },
           body: JSON.stringify({
             inputs: musicPrompt,
@@ -83,6 +84,12 @@ Deno.serve(async (req) => {
           break;
         case 503:
           userMessage = "AI model is loading — please retry in 30 seconds.";
+          break;
+        case 404:
+          userMessage = "Model not found. The MusicGen model may have been moved or is unavailable.";
+          break;
+        case 410:
+          userMessage = "Model deprecated (410 Gone). Please update to a current model.";
           break;
         case 429:
           userMessage = "Rate limited by Hugging Face. Please wait a minute and try again.";
