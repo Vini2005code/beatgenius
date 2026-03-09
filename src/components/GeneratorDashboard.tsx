@@ -122,7 +122,7 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
 
     if (error) {
       console.error("[Generator] Edge function invocation error:", error);
-      throw new Error("Generation failed — Check Hugging Face Token");
+      throw new Error("Generation failed — Check API Token or try again");
     }
 
     if (data?.error) {

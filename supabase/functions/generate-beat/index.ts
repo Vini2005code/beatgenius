@@ -70,7 +70,7 @@ Deno.serve(async (req) => {
           Prefer: "wait",
         },
         body: JSON.stringify({
-          version: "671ac645ce5e552cc63a54a2bbff63fcf798043ac68f86b6588690de4c07e23b",
+          version: "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
           input: {
             model_version: "stereo-melody-large",
             prompt: musicPrompt,
