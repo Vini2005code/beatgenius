@@ -6,23 +6,41 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+async function pollForResult(predictionUrl: string, token: string, maxAttempts = 60): Promise<any> {
+  for (let i = 0; i < maxAttempts; i++) {
+    const res = await fetch(predictionUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    console.log(`[generate-beat] Poll ${i + 1}: status=${data.status}`);
+
+    if (data.status === "succeeded") return data;
+    if (data.status === "failed" || data.status === "canceled") {
+      throw new Error(data.error || "Prediction failed");
+    }
+    // Wait 2 seconds between polls
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("Prediction timed out after 2 minutes");
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    // ── Step 1: Auth – validate HF token exists ──
-    console.log("[generate-beat] Step 1/5: Checking HUGGING_FACE_ACCESS_TOKEN...");
-    const hfToken = Deno.env.get("HUGGING_FACE_ACCESS_TOKEN");
-    if (!hfToken) {
-      console.error("[generate-beat] HUGGING_FACE_ACCESS_TOKEN is NOT set");
+    // ── Step 1: Auth – validate Replicate token ──
+    console.log("[generate-beat] Step 1/5: Checking REPLICATE_API_TOKEN...");
+    const replicateToken = Deno.env.get("REPLICATE_API_TOKEN");
+    if (!replicateToken) {
+      console.error("[generate-beat] REPLICATE_API_TOKEN is NOT set");
       return new Response(
-        JSON.stringify({ error: "HUGGING_FACE_ACCESS_TOKEN is not configured. Add it in project secrets." }),
+        JSON.stringify({ error: "REPLICATE_API_TOKEN is not configured. Add it in project secrets." }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
       );
     }
-    console.log("[generate-beat] Token found (length:", hfToken.length, ")");
+    console.log("[generate-beat] Token found (length:", replicateToken.length, ")");
 
     // ── Step 2: Parse request body ──
     console.log("[generate-beat] Step 2/5: Parsing request body...");
@@ -34,68 +52,62 @@ Deno.serve(async (req) => {
     let musicPrompt: string;
     if (mode === "reference" && reference_audio_base64) {
       musicPrompt = `${genre} instrumental beat, ${bpm} BPM, ${prompt}. Unique copyright-free instrumental with professional production quality.`;
-      console.log("[generate-beat] Reference mode — using style prompt");
     } else {
       musicPrompt = `${genre} beat, ${bpm} BPM, ${prompt}`;
     }
     musicPrompt = musicPrompt.slice(0, 500);
     console.log("[generate-beat] Final prompt:", musicPrompt);
 
-    // ── Step 3: Fetch from Hugging Face ──
-    console.log("[generate-beat] Step 3/5: Calling Hugging Face MusicGen...");
-    let hfResponse: Response;
+    // ── Step 3: Call Replicate API (MusicGen) ──
+    console.log("[generate-beat] Step 3/5: Creating Replicate prediction...");
+    let createRes: Response;
     try {
-      hfResponse = await fetch(
-        "https://router.huggingface.co/hf-inference/models/facebook/musicgen-small",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${hfToken}`,
-            "Content-Type": "application/json",
-            "x-wait-for-model": "true",
+      createRes = await fetch("https://api.replicate.com/v1/predictions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${replicateToken}`,
+          "Content-Type": "application/json",
+          Prefer: "wait",
+        },
+        body: JSON.stringify({
+          version: "671ac645ce5e552cc63a54a2bbff63fcf798043ac68f86b6588690de4c07e23b",
+          input: {
+            model_version: "stereo-melody-large",
+            prompt: musicPrompt,
+            duration: 8,
           },
-          body: JSON.stringify({
-            inputs: musicPrompt,
-            parameters: { max_new_tokens: 512 },
-          }),
-        }
-      );
+        }),
+      });
     } catch (fetchErr) {
-      console.error("[generate-beat] Network error calling Hugging Face:", fetchErr);
+      console.error("[generate-beat] Network error calling Replicate:", fetchErr);
       return new Response(
-        JSON.stringify({ error: "Network error reaching Hugging Face API. Please try again." }),
+        JSON.stringify({ error: "Network error reaching Replicate API. Please try again." }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 502 }
       );
     }
 
-    console.log("[generate-beat] HF response status:", hfResponse.status);
+    console.log("[generate-beat] Replicate response status:", createRes.status);
 
-    if (!hfResponse.ok) {
-      const errorText = await hfResponse.text();
-      console.error("[generate-beat] HF API error:", hfResponse.status, errorText);
+    if (!createRes.ok) {
+      const errorText = await createRes.text();
+      console.error("[generate-beat] Replicate API error:", createRes.status, errorText);
 
       let userMessage: string;
-      switch (hfResponse.status) {
+      switch (createRes.status) {
         case 401:
-          userMessage = "Hugging Face token is invalid. Please update HUGGING_FACE_ACCESS_TOKEN in your project secrets with a valid token.";
+          userMessage = "Replicate API token is invalid. Please update REPLICATE_API_TOKEN in your project secrets.";
           break;
-        case 403:
-          userMessage = "Hugging Face token lacks 'Make calls to Inference Providers' permission. Regenerate your token with this permission enabled.";
+        case 402:
+          userMessage = "Replicate account requires payment setup. Visit replicate.com/account/billing.";
           break;
-        case 503:
-          userMessage = "AI model is loading — please retry in 30 seconds.";
-          break;
-        case 404:
-          userMessage = "Model not found. The MusicGen model may have been moved or is unavailable.";
-          break;
-        case 410:
-          userMessage = "Model deprecated (410 Gone). Please update to a current model.";
+        case 422:
+          userMessage = "Invalid model parameters. Please try different settings.";
           break;
         case 429:
-          userMessage = "Rate limited by Hugging Face. Please wait a minute and try again.";
+          userMessage = "Rate limited by Replicate. Please wait a minute and try again.";
           break;
         default:
-          userMessage = `Hugging Face API error (${hfResponse.status}). Try again later.`;
+          userMessage = `Replicate API error (${createRes.status}). Try again later.`;
       }
 
       return new Response(
@@ -104,15 +116,43 @@ Deno.serve(async (req) => {
       );
     }
 
-    // ── Step 4: Read audio blob ──
-    console.log("[generate-beat] Step 4/5: Reading audio blob...");
-    const audioBlob = await hfResponse.arrayBuffer();
+    let prediction = await createRes.json();
+    console.log("[generate-beat] Prediction created:", prediction.id, "status:", prediction.status);
+
+    // If not completed yet (Prefer: wait may not always work), poll
+    if (prediction.status !== "succeeded") {
+      console.log("[generate-beat] Polling for completion...");
+      prediction = await pollForResult(prediction.urls.get, replicateToken);
+    }
+
+    // ── Step 4: Get audio URL from Replicate ──
+    console.log("[generate-beat] Step 4/5: Extracting audio output...");
+    const replicateAudioUrl = prediction.output;
+    if (!replicateAudioUrl) {
+      console.error("[generate-beat] No audio output from Replicate:", JSON.stringify(prediction));
+      return new Response(
+        JSON.stringify({ error: "No audio was generated. Please try again." }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+      );
+    }
+    console.log("[generate-beat] Replicate audio URL:", replicateAudioUrl);
+
+    // Download the audio from Replicate
+    const audioRes = await fetch(replicateAudioUrl);
+    if (!audioRes.ok) {
+      console.error("[generate-beat] Failed to download audio from Replicate:", audioRes.status);
+      return new Response(
+        JSON.stringify({ error: "Failed to download generated audio." }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+      );
+    }
+    const audioBlob = await audioRes.arrayBuffer();
     console.log("[generate-beat] Audio blob size:", audioBlob.byteLength, "bytes");
 
     if (audioBlob.byteLength < 1000) {
       console.error("[generate-beat] Audio blob too small:", audioBlob.byteLength);
       return new Response(
-        JSON.stringify({ error: "Audio response too small — model may still be loading. Try again in 30s." }),
+        JSON.stringify({ error: "Audio response too small. Try again." }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
       );
     }
