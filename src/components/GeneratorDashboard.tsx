@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -7,13 +7,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Sparkles, Loader2, RotateCcw, Zap, Layers, Music, Upload, FileAudio, X, Shield } from "lucide-react";
+import { Sparkles, Loader2, RotateCcw, Zap, Layers, Music, Upload, FileAudio, X, Shield, Timer } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 
 const GENRES = ["Trap", "Drill", "Afro-Trap", "Rage"] as const;
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+const COOLDOWN_SECONDS = 30;
 
 export interface GeneratedBeat {
   id: string;
@@ -42,11 +43,17 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
 
+  // Cooldown state
+  const [cooldownRemaining, setCooldownRemaining] = useState(0);
+  const cooldownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   // Reference mode state
   const [mode, setMode] = useState<"prompt" | "reference">("prompt");
   const [referenceFile, setReferenceFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const isCooldownActive = cooldownRemaining > 0;
 
   const bpmNum = parseInt(bpm, 10);
   const isValidBpm = !isNaN(bpmNum) && bpmNum >= 60 && bpmNum <= 200;
@@ -54,6 +61,28 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
     mode === "prompt"
       ? prompt.trim().length > 0 && genre && isValidBpm
       : referenceFile !== null && genre && isValidBpm;
+
+  // Cooldown timer effect
+  useEffect(() => {
+    if (cooldownRemaining > 0) {
+      cooldownRef.current = setInterval(() => {
+        setCooldownRemaining((prev) => {
+          if (prev <= 1) {
+            if (cooldownRef.current) clearInterval(cooldownRef.current);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    }
+    return () => {
+      if (cooldownRef.current) clearInterval(cooldownRef.current);
+    };
+  }, [cooldownRemaining > 0]);
+
+  const startCooldown = () => {
+    setCooldownRemaining(COOLDOWN_SECONDS);
+  };
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.name.toLowerCase().endsWith(".mp3")) {
@@ -98,7 +127,6 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
     };
 
     if (mode === "reference" && referenceFile) {
-      // Convert file to base64 for the edge function
       console.log("[Generator] Converting reference MP3 to base64...");
       const arrayBuffer = await referenceFile.arrayBuffer();
       const base64 = btoa(
@@ -122,11 +150,29 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
 
     if (error) {
       console.error("[Generator] Edge function invocation error:", error);
+      // Try to parse the response for rate_limited flag
+      try {
+        const context = (error as any)?.context;
+        if (context) {
+          const responseBody = await context.json?.();
+          if (responseBody?.rate_limited) {
+            throw new Error("RATE_LIMITED");
+          }
+          if (responseBody?.error) {
+            throw new Error(responseBody.error);
+          }
+        }
+      } catch (parseErr: any) {
+        if (parseErr.message === "RATE_LIMITED") throw parseErr;
+      }
       throw new Error("Generation failed — Check API Token or try again");
     }
 
     if (data?.error) {
       console.error("[Generator] Edge function returned error:", data.error);
+      if (data.rate_limited) {
+        throw new Error("RATE_LIMITED");
+      }
       throw new Error(data.error);
     }
 
@@ -139,7 +185,11 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
   };
 
   const handleGenerate = async () => {
-    if (!canGenerate) {
+    if (!canGenerate || isCooldownActive) {
+      if (isCooldownActive) {
+        toast.error(`Please wait ${cooldownRemaining}s before trying again`);
+        return;
+      }
       if (mode === "prompt" && !prompt.trim()) toast.error("Enter your musical vision");
       else if (mode === "reference" && !referenceFile) toast.error("Upload a reference MP3");
       else if (!genre) toast.error("Select a genre");
@@ -150,7 +200,7 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
     setIsGenerating(true);
     setHasFailed(false);
     setProgress(10);
-    setProgressLabel(mode === "reference" ? "Analyzing Reference..." : "Sending to Hugging Face...");
+    setProgressLabel(mode === "reference" ? "Analyzing Reference..." : "Sending to AI...");
     console.log("[Generator] === GENERATION STARTED ===");
 
     try {
@@ -212,8 +262,16 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
       toast.success("Beat generated successfully!");
     } catch (err: unknown) {
       console.error("[Generator] === GENERATION FAILED ===", err);
-      setHasFailed(true);
-      toast.error(err instanceof Error ? err.message : "Generation failed — Check Hugging Face Token");
+      const isRateLimited = err instanceof Error && err.message === "RATE_LIMITED";
+
+      if (isRateLimited) {
+        toast.info("Server is busy. Please wait before trying again...", { duration: 5000 });
+        startCooldown();
+        setHasFailed(false); // Don't show "Try Again" during cooldown
+      } else {
+        setHasFailed(true);
+        toast.error(err instanceof Error ? err.message : "Generation failed — please try again");
+      }
     } finally {
       setIsGenerating(false);
       setProgress(0);
@@ -427,18 +485,33 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
           </div>
         )}
 
+        {/* Cooldown indicator */}
+        {isCooldownActive && !isGenerating && (
+          <div className="flex items-center gap-2 rounded-md bg-muted border border-border p-3">
+            <Timer className="h-4 w-4 text-primary animate-pulse" />
+            <p className="text-sm text-muted-foreground">
+              API is busy, please wait... <span className="font-mono text-primary font-bold">{cooldownRemaining}s</span>
+            </p>
+          </div>
+        )}
+
         {/* Generate Button */}
         <Button
           onClick={handleGenerate}
-          disabled={!canGenerate || isGenerating}
+          disabled={!canGenerate || isGenerating || isCooldownActive}
           className={`w-full h-12 text-base font-bold transition-all ${
-            isGenerating ? "animate-pulse-glow" : canGenerate ? "glow-primary hover:scale-[1.02]" : ""
+            isGenerating ? "animate-pulse-glow" : canGenerate && !isCooldownActive ? "glow-primary hover:scale-[1.02]" : ""
           }`}
         >
           {isGenerating ? (
             <>
               <Loader2 className="mr-2 h-5 w-5 animate-spin" />
               Generating...
+            </>
+          ) : isCooldownActive ? (
+            <>
+              <Timer className="mr-2 h-5 w-5" />
+              Wait {cooldownRemaining}s
             </>
           ) : (
             <>
@@ -448,8 +521,8 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
           )}
         </Button>
 
-        {/* Try Again */}
-        {hasFailed && (
+        {/* Try Again — only after all retries failed and cooldown expired */}
+        {hasFailed && !isCooldownActive && !isGenerating && (
           <Button variant="outline" onClick={handleGenerate} className="w-full border-destructive text-destructive hover:bg-destructive/10">
             <RotateCcw className="mr-2 h-4 w-4" />
             Try Again

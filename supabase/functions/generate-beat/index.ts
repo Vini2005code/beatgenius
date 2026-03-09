@@ -6,6 +6,9 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 2000;
+
 async function pollForResult(predictionUrl: string, token: string, maxAttempts = 60): Promise<any> {
   for (let i = 0; i < maxAttempts; i++) {
     const res = await fetch(predictionUrl, {
@@ -18,10 +21,95 @@ async function pollForResult(predictionUrl: string, token: string, maxAttempts =
     if (data.status === "failed" || data.status === "canceled") {
       throw new Error(data.error || "Prediction failed");
     }
-    // Wait 2 seconds between polls
     await new Promise((r) => setTimeout(r, 2000));
   }
   throw new Error("Prediction timed out after 2 minutes");
+}
+
+async function createPredictionWithRetry(
+  replicateToken: string,
+  requestBody: any
+): Promise<{ prediction: any; wasRetried: boolean }> {
+  let lastError: string = "";
+  let wasRetried = false;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      wasRetried = true;
+      const backoff = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
+      console.log(`[generate-beat] Rate limited by Replicate, retrying in ${backoff / 1000}s... (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+
+    let createRes: Response;
+    try {
+      createRes = await fetch("https://api.replicate.com/v1/predictions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${replicateToken}`,
+          "Content-Type": "application/json",
+          Prefer: "wait",
+        },
+        body: JSON.stringify(requestBody),
+      });
+    } catch (fetchErr) {
+      console.error("[generate-beat] Network error calling Replicate:", fetchErr);
+      lastError = "Network error reaching Replicate API. Please try again.";
+      continue;
+    }
+
+    console.log("[generate-beat] Replicate response status:", createRes.status);
+
+    // Rate limited — retry
+    if (createRes.status === 429) {
+      const errorText = await createRes.text();
+      console.warn("[generate-beat] Rate limited (429):", errorText);
+      lastError = "RATE_LIMITED";
+      continue;
+    }
+
+    // Server error with rate limit message — retry
+    if (createRes.status === 500) {
+      const errorText = await createRes.text();
+      if (errorText.toLowerCase().includes("rate limit")) {
+        console.warn("[generate-beat] Server rate limit (500):", errorText);
+        lastError = "RATE_LIMITED";
+        continue;
+      }
+      lastError = `Replicate API error (500). Try again later.`;
+      // Don't retry non-rate-limit 500s
+      break;
+    }
+
+    if (!createRes.ok) {
+      const errorText = await createRes.text();
+      console.error("[generate-beat] Replicate API error:", createRes.status, errorText);
+
+      switch (createRes.status) {
+        case 401:
+          lastError = "Replicate API token is invalid. Please update REPLICATE_API_TOKEN in your project secrets.";
+          break;
+        case 402:
+          lastError = "Replicate account requires payment setup. Visit replicate.com/account/billing.";
+          break;
+        case 422:
+          lastError = "Invalid model parameters. Please try different settings.";
+          break;
+        default:
+          lastError = `Replicate API error (${createRes.status}). Try again later.`;
+      }
+      // Non-retryable errors
+      break;
+    }
+
+    // Success
+    const prediction = await createRes.json();
+    console.log("[generate-beat] Prediction created:", prediction.id, "status:", prediction.status);
+    return { prediction, wasRetried };
+  }
+
+  // All retries exhausted or non-retryable error
+  throw new Error(lastError);
 }
 
 Deno.serve(async (req) => {
@@ -30,7 +118,6 @@ Deno.serve(async (req) => {
   }
 
   try {
-    // ── Step 1: Auth – validate Replicate token ──
     console.log("[generate-beat] Step 1/5: Checking REPLICATE_API_TOKEN...");
     const replicateToken = Deno.env.get("REPLICATE_API_TOKEN");
     if (!replicateToken) {
@@ -42,13 +129,11 @@ Deno.serve(async (req) => {
     }
     console.log("[generate-beat] Token found (length:", replicateToken.length, ")");
 
-    // ── Step 2: Parse request body ──
     console.log("[generate-beat] Step 2/5: Parsing request body...");
     const body = await req.json();
     const { prompt, genre, bpm, energy_level, instrumental_density, mode, reference_audio_base64 } = body;
     console.log("[generate-beat] Params:", { genre, bpm, mode: mode || "prompt", promptLen: prompt?.length });
 
-    // Build prompt for MusicGen
     let musicPrompt: string;
     if (mode === "reference" && reference_audio_base64) {
       musicPrompt = `${genre} instrumental beat, ${bpm} BPM, ${prompt}. Unique copyright-free instrumental with professional production quality.`;
@@ -58,74 +143,46 @@ Deno.serve(async (req) => {
     musicPrompt = musicPrompt.slice(0, 500);
     console.log("[generate-beat] Final prompt:", musicPrompt);
 
-    // ── Step 3: Call Replicate API (MusicGen) ──
-    console.log("[generate-beat] Step 3/5: Creating Replicate prediction...");
-    let createRes: Response;
+    console.log("[generate-beat] Step 3/5: Creating Replicate prediction (with retry)...");
+
+    let prediction: any;
+    let wasRetried = false;
     try {
-      createRes = await fetch("https://api.replicate.com/v1/predictions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${replicateToken}`,
-          "Content-Type": "application/json",
-          Prefer: "wait",
+      const result = await createPredictionWithRetry(replicateToken, {
+        version: "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
+        input: {
+          model_version: "stereo-melody-large",
+          prompt: musicPrompt,
+          duration: 8,
         },
-        body: JSON.stringify({
-          version: "671ac645ce5e552cc63a54a2bbff63fcf798043055d2dac5fc9e36a837eedcfb",
-          input: {
-            model_version: "stereo-melody-large",
-            prompt: musicPrompt,
-            duration: 8,
-          },
-        }),
       });
-    } catch (fetchErr) {
-      console.error("[generate-beat] Network error calling Replicate:", fetchErr);
+      prediction = result.prediction;
+      wasRetried = result.wasRetried;
+    } catch (retryErr: any) {
+      const errorMessage = retryErr.message || "Generation failed";
+      const isRateLimited = errorMessage === "RATE_LIMITED";
+      console.error("[generate-beat] All retries failed:", errorMessage);
       return new Response(
-        JSON.stringify({ error: "Network error reaching Replicate API. Please try again." }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 502 }
+        JSON.stringify({
+          error: isRateLimited
+            ? "Rate limited by Replicate after multiple retries. Please wait a minute and try again."
+            : errorMessage,
+          rate_limited: isRateLimited,
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: isRateLimited ? 429 : 500 }
       );
     }
 
-    console.log("[generate-beat] Replicate response status:", createRes.status);
-
-    if (!createRes.ok) {
-      const errorText = await createRes.text();
-      console.error("[generate-beat] Replicate API error:", createRes.status, errorText);
-
-      let userMessage: string;
-      switch (createRes.status) {
-        case 401:
-          userMessage = "Replicate API token is invalid. Please update REPLICATE_API_TOKEN in your project secrets.";
-          break;
-        case 402:
-          userMessage = "Replicate account requires payment setup. Visit replicate.com/account/billing.";
-          break;
-        case 422:
-          userMessage = "Invalid model parameters. Please try different settings.";
-          break;
-        case 429:
-          userMessage = "Rate limited by Replicate. Please wait a minute and try again.";
-          break;
-        default:
-          userMessage = `Replicate API error (${createRes.status}). Try again later.`;
-      }
-
-      return new Response(
-        JSON.stringify({ error: userMessage }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
-      );
+    if (wasRetried) {
+      console.log("[generate-beat] ✅ Succeeded after retry!");
     }
 
-    let prediction = await createRes.json();
-    console.log("[generate-beat] Prediction created:", prediction.id, "status:", prediction.status);
-
-    // If not completed yet (Prefer: wait may not always work), poll
+    // Poll if not completed yet
     if (prediction.status !== "succeeded") {
       console.log("[generate-beat] Polling for completion...");
       prediction = await pollForResult(prediction.urls.get, replicateToken);
     }
 
-    // ── Step 4: Get audio URL from Replicate ──
     console.log("[generate-beat] Step 4/5: Extracting audio output...");
     const replicateAudioUrl = prediction.output;
     if (!replicateAudioUrl) {
@@ -137,7 +194,6 @@ Deno.serve(async (req) => {
     }
     console.log("[generate-beat] Replicate audio URL:", replicateAudioUrl);
 
-    // Download the audio from Replicate
     const audioRes = await fetch(replicateAudioUrl);
     if (!audioRes.ok) {
       console.error("[generate-beat] Failed to download audio from Replicate:", audioRes.status);
@@ -157,13 +213,11 @@ Deno.serve(async (req) => {
       );
     }
 
-    // ── Step 5: Upload to Supabase Storage ──
     console.log("[generate-beat] Step 5/5: Uploading to Supabase Storage...");
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, serviceRoleKey);
 
-    // Ensure bucket exists
     const { data: buckets, error: bucketListError } = await supabase.storage.listBuckets();
     if (bucketListError) {
       console.error("[generate-beat] Failed to list buckets:", bucketListError);
