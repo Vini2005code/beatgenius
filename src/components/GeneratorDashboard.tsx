@@ -7,14 +7,22 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Sparkles, Loader2, RotateCcw, Zap, Layers, Music, Upload, FileAudio, X, Shield, Timer } from "lucide-react";
+import { Sparkles, Loader2, RotateCcw, Zap, Layers, Music, Upload, FileAudio, X, Shield, Timer, Wifi, WifiOff, Download } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 
-const GENRES = ["Trap", "Drill", "Afro-Trap", "Rage"] as const;
-const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+const GENRES = ["Trap", "Drill", "Afro-Trap", "Rage", "Lo-Fi", "Eletrônico", "R&B", "Pop", "Funk", "Hip-Hop"] as const;
+const DURATIONS = [
+  { label: "5s", value: 5 },
+  { label: "8s", value: 8 },
+  { label: "10s", value: 10 },
+  { label: "15s", value: 15 },
+  { label: "20s", value: 20 },
+] as const;
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
 const COOLDOWN_SECONDS = 30;
+const LOCAL_BACKEND_KEY = "soundforge_local_url";
 
 export interface GeneratedBeat {
   id: string;
@@ -38,10 +46,20 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
   const [energyLevel, setEnergyLevel] = useState([5]);
   const [instrumentalDensity, setInstrumentalDensity] = useState([5]);
   const [bpm, setBpm] = useState("140");
+  const [duration, setDuration] = useState("8");
   const [isGenerating, setIsGenerating] = useState(false);
   const [hasFailed, setHasFailed] = useState(false);
   const [progress, setProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
+
+  // Backend mode
+  const [backendMode, setBackendMode] = useState<"cloud" | "local">(() => {
+    return localStorage.getItem(LOCAL_BACKEND_KEY) ? "local" : "cloud";
+  });
+  const [localUrl, setLocalUrl] = useState(() => {
+    return localStorage.getItem(LOCAL_BACKEND_KEY) || "http://localhost:8000";
+  });
+  const [localConnected, setLocalConnected] = useState<boolean | null>(null);
 
   // Cooldown state
   const [cooldownRemaining, setCooldownRemaining] = useState(0);
@@ -54,7 +72,6 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const isCooldownActive = cooldownRemaining > 0;
-
   const bpmNum = parseInt(bpm, 10);
   const isValidBpm = !isNaN(bpmNum) && bpmNum >= 60 && bpmNum <= 200;
   const canGenerate =
@@ -62,7 +79,33 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
       ? prompt.trim().length > 0 && genre && isValidBpm
       : referenceFile !== null && genre && isValidBpm;
 
-  // Cooldown timer effect
+  // Check local backend health
+  useEffect(() => {
+    if (backendMode !== "local") return;
+    const check = async () => {
+      try {
+        const res = await fetch(`${localUrl}/health`, { signal: AbortSignal.timeout(3000) });
+        const data = await res.json();
+        setLocalConnected(data.status === "ok");
+      } catch {
+        setLocalConnected(false);
+      }
+    };
+    check();
+    const interval = setInterval(check, 10000);
+    return () => clearInterval(interval);
+  }, [backendMode, localUrl]);
+
+  // Save local URL
+  useEffect(() => {
+    if (backendMode === "local") {
+      localStorage.setItem(LOCAL_BACKEND_KEY, localUrl);
+    } else {
+      localStorage.removeItem(LOCAL_BACKEND_KEY);
+    }
+  }, [backendMode, localUrl]);
+
+  // Cooldown timer
   useEffect(() => {
     if (cooldownRemaining > 0) {
       cooldownRef.current = setInterval(() => {
@@ -75,14 +118,10 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         });
       }, 1000);
     }
-    return () => {
-      if (cooldownRef.current) clearInterval(cooldownRef.current);
-    };
+    return () => { if (cooldownRef.current) clearInterval(cooldownRef.current); };
   }, [cooldownRemaining > 0]);
 
-  const startCooldown = () => {
-    setCooldownRemaining(COOLDOWN_SECONDS);
-  };
+  const startCooldown = () => setCooldownRemaining(COOLDOWN_SECONDS);
 
   const handleFileSelect = useCallback((file: File) => {
     if (!file.name.toLowerCase().endsWith(".mp3")) {
@@ -93,32 +132,48 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
       toast.error("File too large — max 5MB");
       return;
     }
-    console.log("[Generator] Reference file selected:", file.name, file.size, "bytes");
     setReferenceFile(file);
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setIsDragging(false);
-      const file = e.dataTransfer.files[0];
-      if (file) handleFileSelect(file);
-    },
-    [handleFileSelect]
-  );
-
-  const handleDragOver = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback(() => {
     setIsDragging(false);
-  }, []);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFileSelect(file);
+  }, [handleFileSelect]);
 
-  const fetchAudio = async (): Promise<string> => {
-    console.log("[Generator] Calling generate-beat edge function...");
+  const handleDragOver = useCallback((e: React.DragEvent) => { e.preventDefault(); setIsDragging(true); }, []);
+  const handleDragLeave = useCallback(() => setIsDragging(false), []);
 
+  const fetchAudioLocal = async (): Promise<string> => {
+    console.log("[Generator] Calling local backend...");
+    const res = await fetch(`${localUrl}/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        genre,
+        bpm: bpmNum,
+        energy_level: energyLevel[0],
+        instrumental_density: instrumentalDensity[0],
+        duration: parseInt(duration, 10),
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: "Local generation failed" }));
+      throw new Error(err.detail || "Local generation failed");
+    }
+
+    const data = await res.json();
+    if (!data.audio_url) throw new Error("No audio URL from local backend");
+    console.log("[Generator] Local audio URL:", data.audio_url);
+    toast.info(`Generated in ${data.generation_time?.toFixed(1)}s`);
+    return data.audio_url;
+  };
+
+  const fetchAudioCloud = async (): Promise<string> => {
+    console.log("[Generator] Calling cloud edge function...");
     let body: Record<string, unknown> = {
       genre,
       bpm: bpmNum,
@@ -127,11 +182,8 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
     };
 
     if (mode === "reference" && referenceFile) {
-      console.log("[Generator] Converting reference MP3 to base64...");
       const arrayBuffer = await referenceFile.arrayBuffer();
-      const base64 = btoa(
-        new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), "")
-      );
+      const base64 = btoa(new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), ""));
       body = {
         ...body,
         prompt: `Generate a unique, copyright-free instrumental in the same style, mood, and energy as the provided reference`,
@@ -144,23 +196,15 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
       body.mode = "prompt";
     }
 
-    const { data, error } = await supabase.functions.invoke("generate-beat", {
-      body,
-    });
+    const { data, error } = await supabase.functions.invoke("generate-beat", { body });
 
     if (error) {
-      console.error("[Generator] Edge function invocation error:", error);
-      // Try to parse the response for rate_limited flag
       try {
         const context = (error as any)?.context;
         if (context) {
           const responseBody = await context.json?.();
-          if (responseBody?.rate_limited) {
-            throw new Error("RATE_LIMITED");
-          }
-          if (responseBody?.error) {
-            throw new Error(responseBody.error);
-          }
+          if (responseBody?.rate_limited) throw new Error("RATE_LIMITED");
+          if (responseBody?.error) throw new Error(responseBody.error);
         }
       } catch (parseErr: any) {
         if (parseErr.message === "RATE_LIMITED") throw parseErr;
@@ -169,27 +213,17 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
     }
 
     if (data?.error) {
-      console.error("[Generator] Edge function returned error:", data.error);
-      if (data.rate_limited) {
-        throw new Error("RATE_LIMITED");
-      }
+      if (data.rate_limited) throw new Error("RATE_LIMITED");
       throw new Error(data.error);
     }
 
-    if (!data?.audio_url) {
-      throw new Error("No audio URL returned from generation service");
-    }
-
-    console.log("[Generator] Audio URL received:", data.audio_url);
+    if (!data?.audio_url) throw new Error("No audio URL returned");
     return data.audio_url;
   };
 
   const handleGenerate = async () => {
     if (!canGenerate || isCooldownActive) {
-      if (isCooldownActive) {
-        toast.error(`Please wait ${cooldownRemaining}s before trying again`);
-        return;
-      }
+      if (isCooldownActive) { toast.error(`Please wait ${cooldownRemaining}s`); return; }
       if (mode === "prompt" && !prompt.trim()) toast.error("Enter your musical vision");
       else if (mode === "reference" && !referenceFile) toast.error("Upload a reference MP3");
       else if (!genre) toast.error("Select a genre");
@@ -197,29 +231,28 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
       return;
     }
 
+    if (backendMode === "local" && !localConnected) {
+      toast.error("Local backend not connected. Start the Python server first.");
+      return;
+    }
+
     setIsGenerating(true);
     setHasFailed(false);
     setProgress(10);
-    setProgressLabel(mode === "reference" ? "Analyzing Reference..." : "Sending to AI...");
-    console.log("[Generator] === GENERATION STARTED ===");
+    setProgressLabel(backendMode === "local" ? "Generating locally (may take a while)..." : "Sending to AI...");
 
     try {
       setProgress(20);
-      setProgressLabel("Processing Audio Blob...");
-      const audioUrl = await fetchAudio();
+      const audioUrl = backendMode === "local" ? await fetchAudioLocal() : await fetchAudioCloud();
 
-      if (!audioUrl) {
-        throw new Error("Audio source is null — cannot proceed");
-      }
+      if (!audioUrl) throw new Error("Audio source is null");
 
       setProgress(60);
-      setProgressLabel("Uploading to Storage...");
-      console.log("[Generator] Audio URL acquired:", audioUrl);
+      setProgressLabel("Saving to library...");
 
-      const beatTitle =
-        mode === "reference"
-          ? `${genre} Beat — Similar to ${referenceFile?.name.slice(0, 20)}`
-          : `${genre} Beat — ${prompt.slice(0, 30)}`;
+      const beatTitle = mode === "reference"
+        ? `${genre} Beat — Similar to ${referenceFile?.name.slice(0, 20)}`
+        : `${genre} Beat — ${prompt.slice(0, 30)}`;
 
       const { data: insertedBeat, error: dbError } = await supabase
         .from("beats")
@@ -236,14 +269,10 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         .select()
         .single();
 
-      if (dbError) {
-        console.error("[Generator] DB insert error:", dbError);
-        throw dbError;
-      }
+      if (dbError) throw dbError;
 
-      setProgress(90);
+      setProgress(100);
       setProgressLabel("Ready!");
-      console.log("[Generator] Beat saved to DB with id:", insertedBeat.id);
 
       const beat: GeneratedBeat = {
         id: insertedBeat.id,
@@ -256,21 +285,17 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         audioUrl,
       };
 
-      setProgress(100);
-      console.log("[Generator] === GENERATION COMPLETE ===");
       onBeatGenerated?.(beat);
       toast.success("Beat generated successfully!");
     } catch (err: unknown) {
-      console.error("[Generator] === GENERATION FAILED ===", err);
       const isRateLimited = err instanceof Error && err.message === "RATE_LIMITED";
-
       if (isRateLimited) {
-        toast.info("Server is busy. Please wait before trying again...", { duration: 5000 });
+        toast.info("Server is busy. Please wait...", { duration: 5000 });
         startCooldown();
-        setHasFailed(false); // Don't show "Try Again" during cooldown
+        setHasFailed(false);
       } else {
         setHasFailed(true);
-        toast.error(err instanceof Error ? err.message : "Generation failed — please try again");
+        toast.error(err instanceof Error ? err.message : "Generation failed");
       }
     } finally {
       setIsGenerating(false);
@@ -288,6 +313,58 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-5">
+        {/* Backend Mode Toggle */}
+        <div className="space-y-2">
+          <Label className="text-xs text-muted-foreground uppercase tracking-wider">Backend</Label>
+          <div className="flex rounded-lg border border-border overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setBackendMode("cloud")}
+              className={`flex-1 px-3 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${
+                backendMode === "cloud"
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Wifi className="h-3.5 w-3.5" />
+              Cloud (Replicate)
+            </button>
+            <button
+              type="button"
+              onClick={() => setBackendMode("local")}
+              className={`flex-1 px-3 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-1.5 ${
+                backendMode === "local"
+                  ? "bg-secondary text-secondary-foreground"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <WifiOff className="h-3.5 w-3.5" />
+              Local (MusicGen)
+            </button>
+          </div>
+
+          {backendMode === "local" && (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Input
+                  value={localUrl}
+                  onChange={(e) => setLocalUrl(e.target.value)}
+                  placeholder="http://localhost:8000"
+                  className="bg-muted border-border text-foreground text-xs font-mono h-8"
+                />
+                <div className={`h-2.5 w-2.5 rounded-full shrink-0 ${
+                  localConnected === true ? "bg-green-500" : localConnected === false ? "bg-destructive" : "bg-muted-foreground"
+                }`} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {localConnected === true ? "✅ Connected to local MusicGen" :
+                 localConnected === false ? "❌ Backend not running — start the Python server" :
+                 "⏳ Checking connection..."}
+              </p>
+            </div>
+          )}
+        </div>
+
         {/* Mode Toggle */}
         <div className="flex rounded-lg border border-border overflow-hidden">
           <button
@@ -351,16 +428,9 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
                 <FileAudio className="h-8 w-8 text-primary shrink-0" />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-foreground truncate">{referenceFile.name}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {(referenceFile.size / 1024 / 1024).toFixed(2)} MB
-                  </p>
+                  <p className="text-xs text-muted-foreground">{(referenceFile.size / 1024 / 1024).toFixed(2)} MB</p>
                 </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => setReferenceFile(null)}
-                  className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                >
+                <Button variant="ghost" size="icon" onClick={() => setReferenceFile(null)} className="h-8 w-8 text-muted-foreground hover:text-destructive">
                   <X className="h-4 w-4" />
                 </Button>
               </div>
@@ -371,35 +441,19 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
                 onDragLeave={handleDragLeave}
                 onClick={() => fileInputRef.current?.click()}
                 className={`flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-6 cursor-pointer transition-colors ${
-                  isDragging
-                    ? "border-primary bg-primary/5"
-                    : "border-border hover:border-primary/50 hover:bg-muted/50"
+                  isDragging ? "border-primary bg-primary/5" : "border-border hover:border-primary/50 hover:bg-muted/50"
                 }`}
               >
                 <Upload className="h-8 w-8 text-muted-foreground" />
-                <p className="text-sm text-muted-foreground text-center">
-                  Drag & drop an MP3 here, or click to browse
-                </p>
+                <p className="text-sm text-muted-foreground text-center">Drag & drop an MP3 here, or click to browse</p>
                 <p className="text-xs text-muted-foreground">Max 5MB • .mp3 only</p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".mp3,audio/mpeg"
-                  className="hidden"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (file) handleFileSelect(file);
-                  }}
-                />
+                <input ref={fileInputRef} type="file" accept=".mp3,audio/mpeg" className="hidden" onChange={(e) => { const file = e.target.files?.[0]; if (file) handleFileSelect(file); }} />
               </div>
             )}
-
-            {/* Legal compliance notice */}
             <div className="flex items-start gap-2 rounded-md bg-primary/5 border border-primary/20 p-3">
               <Shield className="h-4 w-4 text-primary mt-0.5 shrink-0" />
               <p className="text-xs text-muted-foreground">
-                Generating a <span className="text-primary font-medium">unique version</span> ready for
-                monetization — 100% original and plagiarism-free.
+                Generating a <span className="text-primary font-medium">unique version</span> — 100% original and plagiarism-free.
               </p>
             </div>
           </div>
@@ -408,19 +462,41 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         {/* Genre */}
         <div className="space-y-2">
           <Label className="text-foreground">Genre</Label>
-          {isGenerating ? (
-            <Skeleton className="h-10 w-full" />
-          ) : (
+          {isGenerating ? <Skeleton className="h-10 w-full" /> : (
             <Select value={genre} onValueChange={setGenre}>
               <SelectTrigger className="bg-muted border-border text-foreground">
                 <SelectValue placeholder="Select genre" />
               </SelectTrigger>
               <SelectContent className="bg-card border-border">
-                {GENRES.map((g) => (
-                  <SelectItem key={g} value={g}>{g}</SelectItem>
-                ))}
+                {GENRES.map((g) => <SelectItem key={g} value={g}>{g}</SelectItem>)}
               </SelectContent>
             </Select>
+          )}
+        </div>
+
+        {/* Duration */}
+        <div className="space-y-2">
+          <Label className="flex items-center gap-2 text-foreground">
+            <Timer className="h-4 w-4 text-secondary" />
+            Duration
+          </Label>
+          {isGenerating ? <Skeleton className="h-10 w-full" /> : (
+            <div className="flex gap-2">
+              {DURATIONS.map((d) => (
+                <button
+                  key={d.value}
+                  type="button"
+                  onClick={() => setDuration(String(d.value))}
+                  className={`flex-1 py-2 text-xs font-medium rounded-md border transition-colors ${
+                    duration === String(d.value)
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-muted text-muted-foreground border-border hover:border-primary/50"
+                  }`}
+                >
+                  {d.label}
+                </button>
+              ))}
+            </div>
           )}
         </div>
 
@@ -433,9 +509,7 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
             </span>
             <span className="text-sm font-mono text-primary">{energyLevel[0]}/10</span>
           </Label>
-          {isGenerating ? (
-            <Skeleton className="h-5 w-full" />
-          ) : (
+          {isGenerating ? <Skeleton className="h-5 w-full" /> : (
             <Slider value={energyLevel} onValueChange={setEnergyLevel} min={1} max={10} step={1} />
           )}
         </div>
@@ -449,9 +523,7 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
             </span>
             <span className="text-sm font-mono text-primary">{instrumentalDensity[0]}/10</span>
           </Label>
-          {isGenerating ? (
-            <Skeleton className="h-5 w-full" />
-          ) : (
+          {isGenerating ? <Skeleton className="h-5 w-full" /> : (
             <Slider value={instrumentalDensity} onValueChange={setInstrumentalDensity} min={1} max={10} step={1} />
           )}
         </div>
@@ -459,33 +531,24 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         {/* BPM */}
         <div className="space-y-2">
           <Label htmlFor="bpm" className="text-foreground">BPM (60–200)</Label>
-          {isGenerating ? (
-            <Skeleton className="h-10 w-full" />
-          ) : (
-            <Input
-              id="bpm"
-              type="number"
-              value={bpm}
-              onChange={(e) => setBpm(e.target.value)}
-              min={60}
-              max={200}
-              className="bg-muted border-border text-foreground font-mono"
-            />
+          {isGenerating ? <Skeleton className="h-10 w-full" /> : (
+            <Input id="bpm" type="number" value={bpm} onChange={(e) => setBpm(e.target.value)} min={60} max={200} className="bg-muted border-border text-foreground font-mono" />
           )}
-          {bpm && !isValidBpm && (
-            <p className="text-xs text-destructive">BPM must be between 60 and 200</p>
-          )}
+          {bpm && !isValidBpm && <p className="text-xs text-destructive">BPM must be between 60 and 200</p>}
         </div>
 
-        {/* Progress bar during generation */}
+        {/* Progress */}
         {isGenerating && (
           <div className="space-y-1">
             <Progress value={progress} className="h-2" />
             <p className="text-xs text-muted-foreground text-center">{progressLabel || "Generating your beat..."}</p>
+            {backendMode === "local" && (
+              <p className="text-xs text-muted-foreground/60 text-center">⚠️ Local generation can take 30s–5min depending on hardware</p>
+            )}
           </div>
         )}
 
-        {/* Cooldown indicator */}
+        {/* Cooldown */}
         {isCooldownActive && !isGenerating && (
           <div className="flex items-center gap-2 rounded-md bg-muted border border-border p-3">
             <Timer className="h-4 w-4 text-primary animate-pulse" />
@@ -498,30 +561,21 @@ const GeneratorDashboard = ({ onBeatGenerated }: GeneratorDashboardProps) => {
         {/* Generate Button */}
         <Button
           onClick={handleGenerate}
-          disabled={!canGenerate || isGenerating || isCooldownActive}
+          disabled={!canGenerate || isGenerating || isCooldownActive || (backendMode === "local" && !localConnected)}
           className={`w-full h-12 text-base font-bold transition-all ${
             isGenerating ? "animate-pulse-glow" : canGenerate && !isCooldownActive ? "glow-primary hover:scale-[1.02]" : ""
           }`}
         >
           {isGenerating ? (
-            <>
-              <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-              Generating...
-            </>
+            <><Loader2 className="mr-2 h-5 w-5 animate-spin" />Generating...</>
           ) : isCooldownActive ? (
-            <>
-              <Timer className="mr-2 h-5 w-5" />
-              Wait {cooldownRemaining}s
-            </>
+            <><Timer className="mr-2 h-5 w-5" />Wait {cooldownRemaining}s</>
           ) : (
-            <>
-              <Sparkles className="mr-2 h-5 w-5" />
-              {mode === "reference" ? "Generate Similar Beat" : "Generate Beat"}
-            </>
+            <><Sparkles className="mr-2 h-5 w-5" />{mode === "reference" ? "Generate Similar Beat" : "Generate Beat"}</>
           )}
         </Button>
 
-        {/* Try Again — only after all retries failed and cooldown expired */}
+        {/* Try Again */}
         {hasFailed && !isCooldownActive && !isGenerating && (
           <Button variant="outline" onClick={handleGenerate} className="w-full border-destructive text-destructive hover:bg-destructive/10">
             <RotateCcw className="mr-2 h-4 w-4" />
